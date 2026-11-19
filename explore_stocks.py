@@ -1,91 +1,64 @@
-
-"""
-IB Computer Science SL2
-Stock Database Exploration and Linear Regression Model
-
-Database: Classroom NAS
-Table: bars_5m
-Training: January-December 2024
-Testing: January-June 2025
-Prediction: Stock percentage return 15 minutes ahead
-
-READ-ONLY: The classroom database is never modified.
-"""
-
 import sqlite3
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import numpy as np
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.metrics import mean_absolute_error, r2_score
 
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import (
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score
-)
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.enums import DataFeed
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
 
 # --------------------------------------------------
-# DATABASE SETTINGS
+# SETTINGS (FILL IN YOUR ALPACA KEYS HERE)
 # --------------------------------------------------
 
 DB_PATH = Path(r"\\192.168.1.95\CS-CLASSROOM\intraday_5m.sqlite")
+DB_URI = "file:////192.168.1.95/CS-CLASSROOM/intraday_5m.sqlite?mode=ro&immutable=1"
 
-DB_URI = (
-    "file:////192.168.1.95/CS-CLASSROOM/"
-    "intraday_5m.sqlite?mode=ro&immutable=1"
-)
+ALPACA_API_KEY = "PK776L5EFDVIGWY2S5X2N2DZUM"
+ALPACA_SECRET_KEY = "rydUMA2mD4DPaA13nsQGiWtjW9WqtN1kiRRkNdiJqqv"
 
-STOCK_TO_EXPLORE = "AAPL"
-START_DATE = "2025-01-01"
-END_DATE = "2025-02-01"
-PREVIEW_ROWS = 15
+# Replace "SPY" with your exact S&P 500 ticker from Alpaca
+SYMBOLS_TO_TRADE = ["CMG", "SPY", "TTWO"]
+BUY_THRESHOLD = 0.05  # Buy 1 share if predicted 15m return > 0.05%
 
 
 # --------------------------------------------------
-# SQL DISPLAY FUNCTIONS
+# HELPER: ENGINEER NORMALIZED FEATURES
 # --------------------------------------------------
 
-def show_rows(title, columns, rows):
-    print(f"\n=== {title} ===")
-    print(" | ".join(columns))
+def add_normalized_features(df, groups):
+    """Creates scale-free percentage & ratio features so the tree works across any price/split."""
+    df["ret_5m"] = groups["close"].pct_change(1) * 100
+    df["ret_15m"] = groups["close"].pct_change(3) * 100
+    df["range_pct"] = ((df["high"] - df["low"]) / df["open"]) * 100
 
-    for row in rows:
-        print(" | ".join(str(value) for value in row))
+    rolling_vol = groups["volume"].transform(lambda s: s.rolling(6, min_periods=6).mean())
+    df["rel_volume"] = df["volume"] / rolling_vol.replace(0, np.nan)
 
-
-def query(conn, title, sql, params=()):
-    cursor = conn.execute(sql, params)
-
-    columns = [item[0] for item in cursor.description]
-    rows = cursor.fetchall()
-
-    show_rows(title, columns, rows)
-
-    return rows
+    return ["ret_5m", "ret_15m", "range_pct", "rel_volume"]
 
 
 # --------------------------------------------------
-# LINEAR REGRESSION MODEL
+# 1. TRAIN DECISION TREE ON CLASSROOM DATABASE
 # --------------------------------------------------
 
-def train_regression_model(conn):
+def build_and_train_tree():
+    if not DB_PATH.is_file():
+        raise FileNotFoundError(
+            f"Cannot see {DB_PATH}. Run: net use \\\\192.168.1.95\\CS-CLASSROOM /user:CS-Students"
+        )
 
-    print("\n" + "=" * 55)
-    print("LINEAR REGRESSION TRADING MODEL")
-    print("=" * 55)
-
-    # Retrieve historical stock data
     sql = """
-        SELECT
-            symbol,
-            ts_utc,
-            open,
-            high,
-            low,
-            close,
-            volume
+        SELECT symbol, ts_utc, open, high, low, close, volume
         FROM bars_5m
         WHERE symbol IN ('AAPL', 'MSFT', 'NVDA')
           AND ts_utc >= '2024-01-01'
@@ -93,397 +66,106 @@ def train_regression_model(conn):
         ORDER BY symbol, ts_utc
     """
 
-    df = pd.read_sql_query(sql, conn)
-
-    print("\nTotal stock records retrieved:", len(df))
-
-    if df.empty:
-        raise ValueError("No stock records were retrieved.")
-
-    # Convert timestamps
-    df["ts_utc"] = pd.to_datetime(
-        df["ts_utc"], utc=True
-    )
-
-    # Convert timestamps to New York trading dates
-    df["trading_date"] = (
-        df["ts_utc"]
-        .dt.tz_convert("America/New_York")
-        .dt.date
-    )
-
-    # Sort stock records
-    df = df.sort_values(
-        ["symbol", "ts_utc"]
-    ).copy()
-
-    # Group by stock and trading day
-    groups = df.groupby(
-        ["symbol", "trading_date"],
-        sort=False
-    )
-
-    # ----------------------------------------------
-    # INPUT VARIABLES (X)
-    # ----------------------------------------------
-
-    # Input 1: Current closing price
-    df["current_close"] = df["close"]
-
-    # Input 2: Recent percentage return
-    df["previous_time"] = groups["ts_utc"].shift(1)
-
-    df["recent_return"] = (
-        groups["close"].pct_change() * 100
-    )
-
-    # Input 3: High-low price range
-    df["high_low_range"] = (
-        df["high"] - df["low"]
-    )
-
-    # Input 4: Trading volume
-    df["trading_volume"] = df["volume"]
-
-    # ----------------------------------------------
-    # TARGET VARIABLE (Y)
-    # ----------------------------------------------
-
-    # Closing price three five-minute bars ahead
-    df["future_close"] = groups["close"].shift(-3)
-
-    # Timestamp three bars ahead
-    df["future_time"] = groups["ts_utc"].shift(-3)
-
-    # Calculate future percentage return
-    df["future_return"] = (
-        (df["future_close"] - df["close"])
-        / df["close"]
-    ) * 100
-
-    # ----------------------------------------------
-    # DATA VALIDATION
-    # ----------------------------------------------
-
-    # Previous bar must be exactly five minutes earlier
-    valid_previous = (
-        df["ts_utc"] - df["previous_time"]
-        == pd.Timedelta(minutes=5)
-    )
-
-    # Future bar must be exactly fifteen minutes later
-    valid_future = (
-        df["future_time"] - df["ts_utc"]
-        == pd.Timedelta(minutes=15)
-    )
-
-    df.loc[~valid_previous, "recent_return"] = np.nan
-    df.loc[~valid_future, "future_return"] = np.nan
-
-    # Remove incomplete records
-    df = df.dropna(
-        subset=[
-            "current_close",
-            "recent_return",
-            "high_low_range",
-            "trading_volume",
-            "future_return"
-        ]
-    ).copy()
-
-    # ----------------------------------------------
-    # TRAINING AND TESTING PERIODS
-    # ----------------------------------------------
-
-    train = df[
-        (df["ts_utc"] >= "2024-01-01")
-        & (df["ts_utc"] < "2025-01-01")
-    ].copy()
-
-    test = df[
-        (df["ts_utc"] >= "2025-01-01")
-        & (df["ts_utc"] < "2025-07-01")
-    ].copy()
-
-    if train.empty or test.empty:
-        raise ValueError(
-            "Training or testing data is empty. "
-            "Check the available historical dates."
-        )
-
-    print("\n=== DATASET INFORMATION ===")
-
-    print("Training records:", len(train))
-    print("Testing records:", len(test))
-
-    print("\nTraining records by stock:")
-    print(train.groupby("symbol").size())
-
-    print("\nTesting records by stock:")
-    print(test.groupby("symbol").size())
-
-    # ----------------------------------------------
-    # SELECT INPUTS AND TARGET
-    # ----------------------------------------------
-
-    features = [
-        "current_close",
-        "recent_return",
-        "high_low_range",
-        "trading_volume"
-    ]
-
-    X_train = train[features]
-    y_train = train["future_return"]
-
-    X_test = test[features]
-    y_test = test["future_return"]
-
-    # ----------------------------------------------
-    # TRAIN LINEAR REGRESSION
-    # ----------------------------------------------
-
-    print("\n=== TRAINING MODEL ===")
-
-    model = LinearRegression()
-
-    model.fit(
-        X_train,
-        y_train
-    )
-
-    print("Linear regression model trained successfully!")
-
-    # ----------------------------------------------
-    # MAKE PREDICTIONS
-    # ----------------------------------------------
-
-    predictions = model.predict(X_test)
-
-    # ----------------------------------------------
-    # EVALUATE MODEL
-    # ----------------------------------------------
-
-    mae = mean_absolute_error(
-        y_test, predictions
-    )
-
-    mse = mean_squared_error(
-        y_test, predictions
-    )
-
-    rmse = np.sqrt(mse)
-
-    r2 = r2_score(
-        y_test, predictions
-    )
-
-    print("\n=== MODEL EVALUATION ===")
-
-    print(f"MAE: {mae:.6f} percentage points")
-    print(f"MSE: {mse:.6f}")
-    print(f"RMSE: {rmse:.6f} percentage points")
-    print(f"R-squared: {r2:.6f}")
-
-    # ----------------------------------------------
-    # COMPARE WITH SIMPLE MEAN BASELINE
-    # ----------------------------------------------
-
-    mean_predictions = np.full(
-        len(y_test),
-        y_train.mean()
-    )
-
-    mean_mae = mean_absolute_error(
-        y_test,
-        mean_predictions
-    )
-
-    print("\n=== MEAN BASELINE COMPARISON ===")
-
-    print(f"Mean baseline MAE: {mean_mae:.6f}")
-    print(f"Regression MAE: {mae:.6f}")
-
-    if mae < mean_mae:
-        print("Regression has lower MAE than the mean baseline.")
-    else:
-        print("Regression does not improve on the mean baseline MAE.")
-
-    # ----------------------------------------------
-    # MODEL COEFFICIENTS
-    # ----------------------------------------------
-
-    print("\n=== MODEL COEFFICIENTS ===")
-
-    for feature, coefficient in zip(
-        features,
-        model.coef_
-    ):
-        print(f"{feature}: {coefficient:.8f}")
-
-    print(f"Intercept: {model.intercept_:.8f}")
-
-    # ----------------------------------------------
-    # SAMPLE PREDICTIONS
-    # ----------------------------------------------
-
-    results = test[
-        ["symbol", "ts_utc"]
-    ].copy()
-
-    results["actual_return"] = y_test
-    results["predicted_return"] = predictions
-
-    print("\n=== SAMPLE PREDICTIONS ===")
-
-    print(
-        results.head(15).to_string(index=False)
-    )
-
-    # ----------------------------------------------
-    # RESULTS BY STOCK
-    # ----------------------------------------------
-
-    print("\n=== RESULTS BY STOCK ===")
-
-    results["absolute_error"] = abs(
-        results["actual_return"]
-        - results["predicted_return"]
-    )
-
-    print(
-        results.groupby("symbol")[
-            "absolute_error"
-        ].mean()
-    )
-
-    print("\nModel evaluation complete.")
-
-
-# --------------------------------------------------
-# MAIN PROGRAM
-# --------------------------------------------------
-
-def main():
-
-    if not DB_PATH.is_file():
-        raise FileNotFoundError(
-            f"Cannot see {DB_PATH}. "
-            "Connect to the NAS using the CS-Students account."
-        )
-
-    # Connect to classroom database in read-only mode
-    with sqlite3.connect(
-        DB_URI,
-        uri=True
-    ) as conn:
-
+    with sqlite3.connect(DB_URI, uri=True) as conn:
         conn.execute("PRAGMA query_only = ON")
+        df = pd.read_sql_query(sql, conn)
 
-        # 1. Database tables
-        query(conn, "Database tables", """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table'
-            ORDER BY name
-        """)
+    df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True)
+    df["trading_date"] = df["ts_utc"].dt.tz_convert("America/New_York").dt.date
+    df = df.sort_values(["symbol", "ts_utc"]).copy()
 
-        # 2. Table schema
-        query(
-            conn,
-            "bars_5m column names and types",
-            "PRAGMA table_info(bars_5m)"
-        )
+    groups = df.groupby(["symbol", "trading_date"], sort=False)
 
-        # 3. Available stock symbols
-        query(conn, "Available stock symbols", """
-            SELECT DISTINCT symbol
-            FROM bars_5m
-            ORDER BY symbol
-        """)
+    features = add_normalized_features(df, groups)
 
-        # 4. Historical coverage
-        query(conn, "History available by stock", """
-            SELECT
-                symbol,
-                COUNT(*) AS bar_count,
-                MIN(ts_utc) AS first_bar,
-                MAX(ts_utc) AS last_bar
-            FROM bars_5m
-            GROUP BY symbol
-            ORDER BY bar_count DESC
-        """)
+    # Target (Y): 15-minute ahead return
+    df["future_close"] = groups["close"].shift(-3)
+    df["future_time"] = groups["ts_utc"].shift(-3)
+    df["future_return"] = ((df["future_close"] - df["close"]) / df["close"]) * 100
 
-        # 5. Recent five-minute bars
-        query(
-            conn,
-            f"Recent five-minute bars for {STOCK_TO_EXPLORE}",
-            """
-            SELECT
-                symbol, ts_utc, open, high, low, close, volume
-            FROM bars_5m
-            WHERE symbol = ?
-            ORDER BY ts_utc DESC
-            LIMIT ?
-            """,
-            (STOCK_TO_EXPLORE, PREVIEW_ROWS)
-        )
+    valid_prev = (df["ts_utc"] - groups["ts_utc"].shift(5)) == pd.Timedelta(minutes=25)
+    valid_fut = (df["future_time"] - df["ts_utc"]) == pd.Timedelta(minutes=15)
 
-        # 6. Chosen date range
-        query(
-            conn,
-            f"{STOCK_TO_EXPLORE}: chosen date range",
-            """
-            SELECT
-                symbol, ts_utc, open, high, low, close, volume
-            FROM bars_5m
-            WHERE symbol = ?
-              AND ts_utc >= ?
-              AND ts_utc < ?
-            ORDER BY ts_utc ASC
-            LIMIT ?
-            """,
-            (
-                STOCK_TO_EXPLORE,
-                START_DATE,
-                END_DATE,
-                PREVIEW_ROWS
+    df.loc[~valid_prev, features] = np.nan
+    df.loc[~valid_fut, "future_return"] = np.nan
+    df = df.dropna(subset=features + ["future_return"]).copy()
+
+    train = df[(df["ts_utc"] >= "2024-01-01") & (df["ts_utc"] < "2025-01-01")]
+    test = df[(df["ts_utc"] >= "2025-01-01") & (df["ts_utc"] < "2025-07-01")]
+
+    tree = DecisionTreeRegressor(max_depth=5, min_samples_leaf=50, random_state=42)
+    tree.fit(train[features], train["future_return"])
+
+    preds = tree.predict(test[features])
+    print("=== NORMALIZED DECISION TREE TRAINED ===")
+    print(f"Test MAE: {mean_absolute_error(test['future_return'], preds):.6f}%")
+    print(f"Test R2:  {r2_score(test['future_return'], preds):.6f}")
+
+    return tree, features
+
+
+# --------------------------------------------------
+# 2. CONNECT TO ALPACA & CHECK YOUR 3 STOCKS
+# --------------------------------------------------
+
+def run_alpaca(tree, features):
+    print("\n=== CONNECTING TO ALPACA ===")
+    trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+    data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+    account = trading_client.get_account()
+    print(f"Connected! Buying Power: ${account.buying_power}")
+
+    # Show your current holdings
+    positions = trading_client.get_all_positions()
+    print("\n=== CURRENT POSITIONS ===")
+    for pos in positions:
+        print(f"{pos.symbol}: {pos.qty} shares | Unrealized P/L: ${pos.unrealized_pl}")
+
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=3)
+
+    # Fetch 5-minute bars for all 3 stocks at once
+    request_params = StockBarsRequest(
+        symbol_or_symbols=SYMBOLS_TO_TRADE,
+        timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+        start=start_dt,
+        end=end_dt,
+        feed=DataFeed.IEX
+    )
+
+    all_bars = data_client.get_stock_bars(request_params).df.reset_index()
+
+    print("\n=== DECISION TREE SIGNALS ===")
+    for symbol in SYMBOLS_TO_TRADE:
+        bars = all_bars[all_bars["symbol"] == symbol].copy()
+
+        if len(bars) < 6:
+            print(f"[{symbol}] Not enough recent bars.")
+            continue
+
+        recent_bars = bars.tail(6).copy()
+        recent_bars["dummy_group"] = 1
+        groups = recent_bars.groupby("dummy_group", sort=False)
+        add_normalized_features(recent_bars, groups)
+
+        latest_row = recent_bars.iloc[[-1]][features]
+        latest_close = recent_bars.iloc[-1]["close"]
+        predicted_return = tree.predict(latest_row)[0]
+
+        print(f"[{symbol}] Close: ${latest_close:.2f} | Predicted 15m Return: {predicted_return:.4f}%")
+
+        if predicted_return > BUY_THRESHOLD:
+            order = MarketOrderRequest(
+                symbol=symbol,
+                qty=1,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY
             )
-        )
-
-        # 7. Date range summary
-        query(
-            conn,
-            f"{STOCK_TO_EXPLORE}: period summary",
-            """
-            SELECT
-                symbol,
-                COUNT(*) AS bar_count,
-                MIN(ts_utc) AS first_bar,
-                MAX(ts_utc) AS last_bar,
-                MIN(low) AS lowest_price,
-                MAX(high) AS highest_price,
-                AVG(volume) AS average_bar_volume
-            FROM bars_5m
-            WHERE symbol = ?
-              AND ts_utc >= ?
-              AND ts_utc < ?
-            GROUP BY symbol
-            """,
-            (
-                STOCK_TO_EXPLORE,
-                START_DATE,
-                END_DATE
-            )
-        )
-
-        # 8. Train and evaluate linear regression
-        train_regression_model(conn)
-
-    print("\n" + "=" * 55)
-    print("EXPLORATION AND MODEL TRAINING COMPLETE")
-    print("=" * 55)
+            submitted = trading_client.submit_order(order)
+            print(f"  -> BUY order submitted for 1 share of {symbol} (ID: {submitted.id})")
 
 
 if __name__ == "__main__":
-    main()
+    trained_tree, feature_cols = build_and_train_tree()
+    run_alpaca(trained_tree, feature_cols)
