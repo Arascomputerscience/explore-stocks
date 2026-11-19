@@ -1,3 +1,4 @@
+import time
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -28,7 +29,9 @@ ALPACA_SECRET_KEY = "rydUMA2mD4DPaA13nsQGiWtjW9WqtN1kiRRkNdiJqqv"
 
 # Replace "SPY" with your exact S&P 500 ticker from Alpaca
 SYMBOLS_TO_TRADE = ["CMG", "SPY", "TTWO"]
-BUY_THRESHOLD = 0.05  # Buy 1 share if predicted 15m return > 0.05%
+BUY_THRESHOLD = 0.05       # Buy 1 share if predicted 15m return > 0.05%
+LOOP_SECONDS = 300         # 300 seconds = 5 minutes
+AUTO_SELL_AFTER_15M = True # Automatically close bot-opened trades after 15 minutes
 
 
 # --------------------------------------------------
@@ -48,7 +51,7 @@ def add_normalized_features(df, groups):
 
 
 # --------------------------------------------------
-# 1. TRAIN DECISION TREE ON CLASSROOM DATABASE
+# 1. TRAIN DECISION TREE ONCE AT STARTUP
 # --------------------------------------------------
 
 def build_and_train_tree():
@@ -75,7 +78,6 @@ def build_and_train_tree():
     df = df.sort_values(["symbol", "ts_utc"]).copy()
 
     groups = df.groupby(["symbol", "trading_date"], sort=False)
-
     features = add_normalized_features(df, groups)
 
     # Target (Y): 15-minute ahead return
@@ -97,7 +99,7 @@ def build_and_train_tree():
     tree.fit(train[features], train["future_return"])
 
     preds = tree.predict(test[features])
-    print("=== NORMALIZED DECISION TREE TRAINED ===")
+    print("=== DECISION TREE TRAINED ===")
     print(f"Test MAE: {mean_absolute_error(test['future_return'], preds):.6f}%")
     print(f"Test R2:  {r2_score(test['future_return'], preds):.6f}")
 
@@ -105,41 +107,48 @@ def build_and_train_tree():
 
 
 # --------------------------------------------------
-# 2. CONNECT TO ALPACA & CHECK YOUR 3 STOCKS
+# 2. SINGLE CHECK CYCLE
 # --------------------------------------------------
 
-def run_alpaca(tree, features):
-    print("\n=== CONNECTING TO ALPACA ===")
-    trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
-    data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+def check_market_and_trade(trading_client, data_client, tree, features, active_bot_trades):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n[{now_str}] Checking market status...")
 
-    account = trading_client.get_account()
-    print(f"Connected! Buying Power: ${account.buying_power}")
+    clock = trading_client.get_clock()
+    if not clock.is_open:
+        print(f"Market is currently CLOSED. Next open: {clock.next_open}")
+        return
 
-    # Show your current holdings
-    positions = trading_client.get_all_positions()
-    print("\n=== CURRENT POSITIONS ===")
-    for pos in positions:
-        print(f"{pos.symbol}: {pos.qty} shares | Unrealized P/L: ${pos.unrealized_pl}")
+    now_utc = datetime.now(timezone.utc)
 
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=3)
+    # 1. Close any bot trades that have been open for >= 15 minutes
+    if AUTO_SELL_AFTER_15M:
+        for symbol in list(active_bot_trades.keys()):
+            entry_time = active_bot_trades[symbol]
+            if now_utc - entry_time >= timedelta(minutes=15):
+                sell_order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=1,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY
+                )
+                submitted = trading_client.submit_order(sell_order)
+                print(f"  -> 15 MIN ELAPSED: Sold 1 share of {symbol} (ID: {submitted.id})")
+                del active_bot_trades[symbol]
 
-    # Fetch 5-minute bars for all 3 stocks at once
+    # 2. Fetch the latest 5-minute bars for all 3 symbols
     request_params = StockBarsRequest(
         symbol_or_symbols=SYMBOLS_TO_TRADE,
         timeframe=TimeFrame(5, TimeFrameUnit.Minute),
-        start=start_dt,
-        end=end_dt,
+        start=now_utc - timedelta(days=3),
+        end=now_utc,
         feed=DataFeed.IEX
     )
 
     all_bars = data_client.get_stock_bars(request_params).df.reset_index()
 
-    print("\n=== DECISION TREE SIGNALS ===")
     for symbol in SYMBOLS_TO_TRADE:
         bars = all_bars[all_bars["symbol"] == symbol].copy()
-
         if len(bars) < 6:
             print(f"[{symbol}] Not enough recent bars.")
             continue
@@ -155,7 +164,8 @@ def run_alpaca(tree, features):
 
         print(f"[{symbol}] Close: ${latest_close:.2f} | Predicted 15m Return: {predicted_return:.4f}%")
 
-        if predicted_return > BUY_THRESHOLD:
+        # Avoid double-buying a symbol the bot is already holding for a 15m cycle
+        if predicted_return > BUY_THRESHOLD and symbol not in active_bot_trades:
             order = MarketOrderRequest(
                 symbol=symbol,
                 qty=1,
@@ -163,9 +173,42 @@ def run_alpaca(tree, features):
                 time_in_force=TimeInForce.DAY
             )
             submitted = trading_client.submit_order(order)
-            print(f"  -> BUY order submitted for 1 share of {symbol} (ID: {submitted.id})")
+            active_bot_trades[symbol] = now_utc
+            print(f"  -> BUY ORDER SUBMITTED: 1 share of {symbol} (ID: {submitted.id})")
+
+
+# --------------------------------------------------
+# 3. MAIN AUTOMATED 5-MINUTE LOOP
+# --------------------------------------------------
+
+def run_automated_loop():
+    trained_tree, feature_cols = build_and_train_tree()
+
+    trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+    data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+    account = trading_client.get_account()
+    print(f"\nConnected to Alpaca Paper Account! Buying Power: ${account.buying_power}")
+    print("Starting automated 5-minute loop (Press Ctrl + C in terminal to stop)...\n")
+
+    # Tracks {symbol: entry_timestamp} for bot-initiated trades (won't touch your manual shares)
+    active_bot_trades = {}
+
+    while True:
+        try:
+            check_market_and_trade(
+                trading_client,
+                data_client,
+                trained_tree,
+                feature_cols,
+                active_bot_trades
+            )
+        except Exception as e:
+            print(f"[WARNING] Error during cycle (will retry in 5 mins): {e}")
+
+        print(f"Sleeping for {LOOP_SECONDS // 60} minutes...")
+        time.sleep(LOOP_SECONDS)
 
 
 if __name__ == "__main__":
-    trained_tree, feature_cols = build_and_train_tree()
-    run_alpaca(trained_tree, feature_cols)
+    run_automated_loop()
